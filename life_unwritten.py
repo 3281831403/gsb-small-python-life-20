@@ -1,10 +1,43 @@
 #CLI Text Baed Game for Github GameOff 2024
 
-import random
+import copy
+import os
 import time
 import json
 from typing import Dict, List, Any
 from dataclasses import dataclass, asdict
+
+FAST_MODE = os.environ.get("LIFE_UNWRITTEN_FAST") == "1"
+
+SAVE_PATH = "savegame.json"
+
+# Table-driven mapping from bond level to an NPC's current mood.
+MOOD_BY_BOND = [
+    (80, "devoted"),
+    (60, "warm"),
+    (40, "hopeful"),
+    (20, "guarded"),
+    (0, "estranged"),
+]
+
+
+def mood_for_bond(bond_level: int) -> str:
+    """Deterministically derive an NPC mood from their bond level."""
+    for threshold, mood in MOOD_BY_BOND:
+        if bond_level >= threshold:
+            return mood
+    return MOOD_BY_BOND[-1][1]
+
+
+def clamp(value: int, low: int = 0, high: int = 100) -> int:
+    return max(low, min(high, value))
+
+
+def pause(seconds: float):
+    """Sleep unless running in fast (test/smoke) mode."""
+    if not FAST_MODE:
+        time.sleep(seconds)
+
 
 @dataclass
 class Character:
@@ -24,7 +57,47 @@ class GameState:
         self.characters = {}
         self.game_over = False
         self.reflection_count = 0
-        
+
+    def snapshot(self) -> "GameState":
+        """Deep-copy snapshot so later mutations never alias saved state."""
+        return copy.deepcopy(self)
+
+    def restore(self, snapshot: "GameState"):
+        """Restore from a snapshot (deep-copied again to avoid aliasing)."""
+        self.__dict__.clear()
+        self.__dict__.update(copy.deepcopy(snapshot.__dict__))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize deterministically (characters sorted by name)."""
+        return {
+            'player_name': self.player_name,
+            'mood': self.mood,
+            'day': self.day,
+            'reflection_count': self.reflection_count,
+            'game_over': self.game_over,
+            'choices_made': copy.deepcopy(self.choices_made),
+            'characters': {
+                name: asdict(self.characters[name])
+                for name in sorted(self.characters)
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GameState":
+        """Build a fresh state from serialized data (validates required keys)."""
+        state = cls()
+        state.player_name = data['player_name']
+        state.mood = data['mood']
+        state.day = data['day']
+        state.reflection_count = data['reflection_count']
+        state.game_over = data['game_over']
+        state.choices_made = copy.deepcopy(data['choices_made'])
+        state.characters = {
+            name: Character(**char_data)
+            for name, char_data in data['characters'].items()
+        }
+        return state
+
     def save_choice(self, choice_description: str, impact: str):
         self.choices_made.append({
             'day': self.day,
@@ -106,7 +179,8 @@ class LifeUnwritten:
         """Print text with a typewriter effect"""
         for char in text:
             print(char, end='', flush=True)
-            time.sleep(delay)
+            if not FAST_MODE:
+                time.sleep(delay)
         print()
     
     def get_user_input(self, prompt: str) -> str:
@@ -128,7 +202,7 @@ class LifeUnwritten:
             self.state.player_name = "Traveler"
         
         self.print_slow(f"\nHello, {self.state.player_name}. Your story begins now...")
-        time.sleep(2)
+        pause(2)
         
         self.show_opening_story()
     
@@ -169,10 +243,12 @@ The question is: where do you begin?
             print("2. 🪞 Reflect on your journey")
             print("3. 📚 Review your past choices")
             print("4. 📊 Check relationship status")
-            print("5. 🚪 End the day")
-            print("6. ❌ Quit game")
+            print("5. 💾 Save game")
+            print("6. 📂 Load game")
+            print("7. 🚪 End the day")
+            print("8. ❌ Quit game")
             
-            choice = self.get_user_input("Choose an option (1-6)")
+            choice = self.get_user_input("Choose an option (1-8)")
             
             if choice == "1":
                 self.character_interaction_menu()
@@ -183,12 +259,52 @@ The question is: where do you begin?
             elif choice == "4":
                 self.show_relationship_status()
             elif choice == "5":
-                self.end_day()
+                self.save_game()
             elif choice == "6":
+                self.load_game()
+            elif choice == "7":
+                self.end_day()
+            elif choice == "8":
                 self.quit_game()
             else:
                 print("❌ Invalid choice. Please try again.")
-                time.sleep(1)
+                pause(1)
+
+    def save_game(self, path: str = SAVE_PATH) -> bool:
+        """Persist a deep-copied snapshot; the live state is never aliased."""
+        try:
+            data = self.state.to_dict()
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            print(f"\n💾 Game saved to {path} (Day {self.state.day}).")
+            pause(1)
+            return True
+        except Exception as e:
+            print(f"\n❌ Could not save game: {e}")
+            pause(1)
+            return False
+
+    def load_game(self, path: str = SAVE_PATH) -> bool:
+        """Load a saved game atomically.
+
+        The new state is fully built and validated before it replaces the
+        current one, so a corrupt or missing save never rolls back or
+        partially mutates the live character state.
+        """
+        snapshot = self.state.snapshot()
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            new_state = GameState.from_dict(data)
+        except Exception as e:
+            self.state.restore(snapshot)
+            print(f"\n❌ Could not load game: {e}")
+            pause(1)
+            return False
+        self.state.restore(new_state)
+        print(f"\n📂 Game loaded (Day {self.state.day}).")
+        pause(1)
+        return True
     
     def character_interaction_menu(self):
         """Show available characters to interact with"""
@@ -197,29 +313,31 @@ The question is: where do you begin?
         
         print(f"\n💬 Who would you like to reach out to, {self.state.player_name}?")
         print("\nYour relationships:")
-        
-        for i, (name, char) in enumerate(self.state.characters.items(), 1):
+
+        names = sorted(self.state.characters.keys())
+        for i, name in enumerate(names, 1):
+            char = self.state.characters[name]
             bond_status = self.get_bond_description(char.bond_level)
             print(f"{i}. {char.name} ({char.relationship}) - {bond_status}")
             print(f"   Last interaction: {char.last_interaction}")
-        
-        print(f"{len(self.state.characters) + 1}. 🔙 Go back")
-        
+
+        print(f"{len(names) + 1}. 🔙 Go back")
+
         choice = self.get_user_input("Choose someone to contact (number)")
-        
+
         try:
             choice_num = int(choice)
-            if 1 <= choice_num <= len(self.state.characters):
-                char_name = list(self.state.characters.keys())[choice_num - 1]
+            if 1 <= choice_num <= len(names):
+                char_name = names[choice_num - 1]
                 self.interact_with_character(char_name)
-            elif choice_num == len(self.state.characters) + 1:
+            elif choice_num == len(names) + 1:
                 return
             else:
                 print("❌ Invalid choice.")
-                time.sleep(1)
+                pause(1)
         except ValueError:
             print("❌ Please enter a valid number.")
-            time.sleep(1)
+            pause(1)
     
     def get_bond_description(self, bond_level: int) -> str:
         """Convert bond level to description"""
@@ -249,7 +367,7 @@ The question is: where do you begin?
         scenarios = self.get_interaction_scenarios(character)
         
         print(f"\n💭 {character.name} responds to your message...")
-        time.sleep(2)
+        pause(2)
         
         print(f"\n'{scenarios['response']}'")
         print(f"\nHow do you respond?")
@@ -265,10 +383,10 @@ The question is: where do you begin?
                 self.process_interaction_choice(character, scenarios['options'][choice_num])
             else:
                 print("❌ Invalid choice.")
-                time.sleep(1)
+                pause(1)
         except ValueError:
             print("❌ Please enter a valid number.")
-            time.sleep(1)
+            pause(1)
     
     def get_interaction_scenarios(self, character: Character) -> Dict[str, Any]:
         """Generate interaction scenarios based on character relationship"""
@@ -317,33 +435,61 @@ The question is: where do you begin?
     
     def process_interaction_choice(self, character: Character, choice: Dict[str, Any]):
         """Process the outcome of an interaction choice"""
-        old_bond = character.bond_level
-        old_mood = self.state.mood
-        
-        # Apply changes
-        character.bond_level = max(0, min(100, character.bond_level + choice['bond_change']))
-        self.state.mood = max(0, min(100, self.state.mood + choice['mood_change']))
-        
-        # Update last interaction
-        character.last_interaction = choice['text']
-        
-        # Save the choice
-        impact = f"Bond with {character.name}: {old_bond} → {character.bond_level}, Mood: {old_mood} → {self.state.mood}"
-        self.state.save_choice(f"Talked to {character.name}: {choice['text']}", impact)
-        
+        outcome = self.apply_interaction(character.name, choice)
+
         # Show outcome
         print(f"\n✨ Outcome:")
-        print(f"Bond with {character.name}: {old_bond} → {character.bond_level}")
-        print(f"Your mood: {old_mood} → {self.state.mood}")
-        
-        # Generate follow-up response
-        follow_up = self.generate_follow_up_response(character, choice['bond_change'])
-        print(f"\n{character.name}: '{follow_up}'")
-        
+        print(f"Bond with {character.name}: {outcome['old_bond']} → {outcome['new_bond']}")
+        print(f"Your mood: {outcome['old_mood']} → {outcome['new_mood']}")
+        print(f"{character.name} now feels: {outcome['character_mood']}")
+
+        print(f"\n{character.name}: '{outcome['follow_up']}'")
+
         input("\nPress Enter to continue...")
+
+    def apply_interaction(self, char_name: str, choice: Dict[str, Any]) -> Dict[str, Any]:
+        """Transactionally apply an interaction choice.
+
+        Bond, player mood, NPC mood and the choice log are updated as one
+        atomic unit: any failure restores the full pre-interaction snapshot
+        so a failed conversation can never leave partial state behind.
+        """
+        snapshot = self.state.snapshot()
+        try:
+            character = self.state.characters[char_name]
+            old_bond = character.bond_level
+            old_mood = self.state.mood
+
+            character.bond_level = clamp(character.bond_level + choice['bond_change'])
+            self.state.mood = clamp(self.state.mood + choice['mood_change'])
+
+            # Keep the NPC's mood in sync with the new bond level.
+            character.current_mood = mood_for_bond(character.bond_level)
+            character.last_interaction = choice['text']
+
+            impact = (f"Bond with {character.name}: {old_bond} → {character.bond_level}, "
+                      f"Mood: {old_mood} → {self.state.mood}")
+            self.state.save_choice(f"Talked to {character.name}: {choice['text']}", impact)
+
+            follow_up = self.generate_follow_up_response(character, choice['bond_change'])
+            return {
+                'old_bond': old_bond,
+                'new_bond': character.bond_level,
+                'old_mood': old_mood,
+                'new_mood': self.state.mood,
+                'character_mood': character.current_mood,
+                'follow_up': follow_up,
+            }
+        except Exception:
+            self.state.restore(snapshot)
+            raise
     
     def generate_follow_up_response(self, character: Character, bond_change: int) -> str:
-        """Generate a follow-up response based on the interaction outcome"""
+        """Generate a deterministic follow-up response.
+
+        The pick depends only on game state (day) and the bond change, never
+        on RNG or dictionary iteration order, so results are reproducible.
+        """
         if bond_change > 15:
             responses = [
                 "Thank you for reaching out. This means a lot to me.",
@@ -368,8 +514,9 @@ The question is: where do you begin?
                 "This doesn't really change anything between us.",
                 "I think we both need more time."
             ]
-        
-        return random.choice(responses)
+
+        index = (self.state.day + bond_change) % len(responses)
+        return responses[index]
     
     def reflection_menu(self):
         """Handle personal reflection to improve mood"""
@@ -413,7 +560,7 @@ The question is: where do you begin?
             }
         ]
         
-        reflection = random.choice(reflections)
+        reflection = reflections[(self.state.day + self.state.reflection_count) % len(reflections)]
         
         print(f"\n💭 Reflection: {reflection['prompt']}")
         
@@ -425,7 +572,7 @@ The question is: where do you begin?
         try:
             choice_num = int(choice)
             if 1 <= choice_num <= len(reflection['responses']):
-                mood_boost = random.randint(8, 15)
+                mood_boost = 8 + (self.state.day + self.state.reflection_count * 3) % 8
                 old_mood = self.state.mood
                 self.state.mood = min(100, self.state.mood + mood_boost)
                 self.state.reflection_count += 1
@@ -442,10 +589,10 @@ The question is: where do you begin?
                 input("\nPress Enter to continue...")
             else:
                 print("❌ Invalid choice.")
-                time.sleep(1)
+                pause(1)
         except ValueError:
             print("❌ Please enter a valid number.")
-            time.sleep(1)
+            pause(1)
     
     def review_choices(self):
         """Show the player's choice history"""
@@ -475,9 +622,10 @@ The question is: where do you begin?
         
         print("📊 Relationship Status Report")
         print("=" * 40)
-        
+
         total_bond = 0
-        for char in self.state.characters.values():
+        for name in sorted(self.state.characters.keys()):
+            char = self.state.characters[name]
             bond_desc = self.get_bond_description(char.bond_level)
             print(f"\n{char.name} ({char.relationship})")
             print(f"Bond Level: {char.bond_level}/100 - {bond_desc}")
@@ -523,13 +671,24 @@ The question is: where do you begin?
         elif self.state.day >= 7:  # Game ends after 7 days
             self.neutral_ending()
         else:
-            self.state.day += 1
-            self.state.reflection_count = 0  # Reset daily reflection limit
-            
+            self.advance_day()
+
             print(f"\n🌄 Tomorrow is Day {self.state.day}.")
             print("What will you choose to do?")
-            
+
             input("\nPress Enter to continue...")
+
+    def advance_day(self) -> bool:
+        """Advance exactly one day.
+
+        Guarded so a day can never be pushed forward twice (e.g. after an
+        ending already fired) and the daily reflection limit resets here.
+        """
+        if self.state.game_over:
+            return False
+        self.state.day += 1
+        self.state.reflection_count = 0
+        return True
     
     def good_ending(self):
         """Show the good ending"""
